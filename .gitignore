@@ -1,0 +1,11 @@
+# Ignore everything by default
+*
+
+# But don't ignore the .gitignore file itself
+!.gitignore
+
+# Whitelist Python files
+!*.py
+
+# Whitelist Jupyter Notebooks
+!*.ipynb
