@@ -124,9 +124,10 @@ df_desc_exploded = df_desc_subset.explode("Case IDs").rename(columns={"Case IDs"
 splits = ["train", "val", "test"]
 num_folds = 10
 
-for fold in range(num_folds):
+for foldz in range(num_folds):
+    fold = foldz + 1
     # Create an output folder for the fold; note: fold folders are 1-indexed.
-    fold_out_dir = os.path.join(OUTPUT_BASE_DIR, f"fold_{fold+1}")
+    fold_out_dir = os.path.join(OUTPUT_BASE_DIR, f"fold_{fold}")
     os.makedirs(fold_out_dir, exist_ok=True)
     
     for split in splits:
