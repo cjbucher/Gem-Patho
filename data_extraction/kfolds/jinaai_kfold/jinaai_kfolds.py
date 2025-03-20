@@ -28,6 +28,11 @@ gene_embs_path = "/home/chb3333/yulab/chb3333/gem-patho/data_extraction/genename
 df_gene_embs = pd.read_parquet(gene_embs_path, engine="pyarrow")
 gene_embeddings_dict = {gene: row.values for gene, row in df_gene_embs.iterrows()}
 
+# --- Load CNA Data ---
+cna_path = "/home/chb3333/yulab/chb3333/gem-patho/data_extraction/CNAs/cna_data.parquet"
+df_cna = pd.read_parquet(cna_path, engine="pyarrow")
+
+
 # --- Gene Name Resolution ---
 gene_synonyms = {
     "C15orf65": "CCDC186",
@@ -47,15 +52,40 @@ def resolve_gene_name(gene):
         return None
     return gene_synonyms.get(gene, gene)
 
-def map_polyphen_to_gene_embeds(polyphen_vector, gene_list, gene_embeddings):
+# --- Helper Functions for CNA ---
+def normalize_patient_id(pid):
+    """
+    Normalize a TCGA patient barcode by taking the first three parts.
+    E.g. "TCGA-OR-A5J8-01" becomes "TCGA-OR-A5J8".
+    """
+    parts = pid.split('-')
+    if len(parts) >= 4:
+        return "-".join(parts[:3])
+    else:
+        return pid
+
+def get_patient_cna(case_id, cna_df):
+    """
+    Retrieve the CNA record for a given patient using the normalized 'Case ID'.
+    """
+    norm_pid = normalize_patient_id(case_id)
+    patient_cna = cna_df[cna_df["normalized_patient_id"] == norm_pid]
+    return patient_cna
+
+# --- Modified Mapping Function to Include CNA Info ---
+def map_polyphen_to_gene_embeds(polyphen_vector, gene_list, gene_embeddings, case_id, cna_df):
     """
     For every nonzero score in polyphen_vector (aligned with gene_list),
-    return a list of dicts with resolved gene name, its embedding, and the score.
+    return a list of dicts with resolved gene name, its embedding, the score, and the CNA value.
     """
     seq = []
     if len(polyphen_vector) != len(gene_list):
         print(f"Length mismatch: {len(polyphen_vector)} vs {len(gene_list)}")
         return seq
+    
+    # Retrieve the patient's CNA data (if available)
+    patient_cna = get_patient_cna(case_id, cna_df)
+    
     for gene, score in zip(gene_list, polyphen_vector):
         if score == 0:
             continue
@@ -66,10 +96,23 @@ def map_polyphen_to_gene_embeds(polyphen_vector, gene_list, gene_embeddings):
             emb = gene_embeddings[resolved]
             if isinstance(emb, np.ndarray):
                 emb = emb.tolist()
-            seq.append({"gene": resolved, "embedding": emb, "score": score})
+            # For CNA lookup, switch 'CTNNB1' to 'CTNNBIP1'
+            gene_mapped = "CTNNBIP1" if resolved == "CTNNB1" else resolved
+            # Get CNA number: default to 2 if not found or if CNA data is missing
+            if patient_cna.empty:
+                cna_number = 2
+            else:
+                if gene_mapped in patient_cna.columns:
+                    cna_number = patient_cna.iloc[0][gene_mapped]
+                    if pd.isna(cna_number):
+                        cna_number = 2
+                else:
+                    cna_number = 2
+            seq.append({"gene": resolved, "embedding": emb, "score": score, "cna": cna_number})
         else:
             print(f"Warning: Embedding for '{resolved}' not found.")
     return seq
+
 
 # --- Process Description Metadata ---
 # Keep only needed columns, split the comma-separated "Case IDs", and explode
@@ -102,8 +145,11 @@ for fold in range(num_folds):
 
         # Map polyphen scores to gene embedding sequences if column exists
         if "polyphen_score" in df_merged.columns:
-            df_merged["gene_embed_seq"] = df_merged["polyphen_score"].apply(
-                lambda vec: map_polyphen_to_gene_embeds(vec, gene_list, gene_embeddings_dict)
+            df_merged["gene_embed_seq"] = df_merged.apply(
+                lambda row: map_polyphen_to_gene_embeds(
+                    row["polyphen_score"], gene_list, gene_embeddings_dict, row["Case ID"], df_cna
+                ),
+                axis=1
             )
         else:
             print(f"Warning: 'polyphen_score' not in fold {fold} {split}.")
