@@ -157,8 +157,12 @@ for foldz in range(num_folds):
 
         # Clean: drop rows missing OS.time, OS, or type; drop CANCER_TYPE_ACRONYM if present
         df_clean = df_merged.dropna(subset=["OS.time", "OS", "type"])
+<<<<<<< HEAD
+=======
+
+>>>>>>> recovery_branch
 
         # Save processed file: file name is simply split.parquet in the corresponding fold folder.
         output_file = os.path.join(fold_out_dir, f"{split}.parquet")
         df_clean.to_parquet(output_file, engine="pyarrow", index=False)
-        print(f"Saved processed fold {fold+1} {split} to {output_file}")
+        print(f"Saved processed fold {fold} {split} to {output_file}")
