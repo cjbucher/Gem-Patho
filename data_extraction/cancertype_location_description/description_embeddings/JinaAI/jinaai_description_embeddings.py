@@ -10,6 +10,11 @@ print(device)
 df_path = "/home/chb3333/yulab/chb3333/gem-patho/data_extraction/cancertype_location_description/location_description/description_meta_with_answers.parquet"
 df = pd.read_parquet(df_path)
 
+df_path2 = "/home/chb3333/yulab/chb3333/gem-patho/data_extraction/cancertype_location_description/location_desciption_withoutICD/description_meta_with_answers.parquet"
+df2 = pd.read_parquet(df_path2)
+
+df = pd.concat([df, df2], ignore_index=True, sort=False)
+
 model = SentenceTransformer("jinaai/jina-embeddings-v3", trust_remote_code=True).to(device)
 
 embeddings = model.encode(

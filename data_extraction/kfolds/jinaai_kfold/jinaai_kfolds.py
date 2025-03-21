@@ -157,8 +157,6 @@ for foldz in range(num_folds):
 
         # Clean: drop rows missing OS.time, OS, or type; drop CANCER_TYPE_ACRONYM if present
         df_clean = df_merged.dropna(subset=["OS.time", "OS", "type"])
-        if "CANCER_TYPE_ACRONYM" in df_clean.columns:
-            df_clean = df_clean.drop("CANCER_TYPE_ACRONYM", axis=1)
 
         # Save processed file: file name is simply split.parquet in the corresponding fold folder.
         output_file = os.path.join(fold_out_dir, f"{split}.parquet")
