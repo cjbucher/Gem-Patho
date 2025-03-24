@@ -9,7 +9,7 @@ Data files are now assumed to be in:
   Model outputs will be saved in:
     /home/chb3333/yulab/chb3333/gem-patho/models/gene_name_seqs/cna_cancertype_polyphen_models/gene_name_polyphen_sum/jina_polyphen
 
-Cancer type information is provided via the "CANCER_TYPE_ACRONYM" column.
+Cancer type information is provided via the "type" column.
 It is converted to a 6-dimensional binary vector (based on an index mapping from the file:
   /home/chb3333/yulab/chb3333/gem-patho/data_extraction/cancertype_location_description/tcga_study_abbreviations.csv)
 and fed through an MLP. Its output is added (broadcast over the token dimension) along with the other projections.
@@ -86,7 +86,7 @@ class PreprocessedSequenceDataset(Dataset):
               "gene", "embedding", "score", "cna").
           - "OS.time": survival time.
           - "OS": event indicator.
-          - "CANCER_TYPE_ACRONYM": cancer type abbreviation.
+          - "type": cancer type abbreviation.
         If a token list is empty, a default token is created.
         """
         self.df = df.reset_index(drop=True)
@@ -134,7 +134,7 @@ class PreprocessedSequenceDataset(Dataset):
         cnas = [torch.tensor(token.get("cna", 0.0), dtype=torch.float) for token in tokens]
         
         # Process cancer type: retrieve from the row and map to binary vector.
-        cancer_type_acronym = row.get("CANCER_TYPE_ACRONYM", None)
+        cancer_type_acronym = row.get("type", None)
         if cancer_type_acronym is None or cancer_type_acronym not in self.cancer_type_mapping:
             ct_vector = [0]*6
         else:
@@ -360,7 +360,7 @@ def main():
         val_df   = pd.read_parquet(val_path, engine="pyarrow")
         test_df  = pd.read_parquet(test_path, engine="pyarrow")
         # Keep only required columns (including cancer type)
-        cols = ["gene_embed_seq", "OS.time", "OS", "CANCER_TYPE_ACRONYM"]
+        cols = ["gene_embed_seq", "OS.time", "OS", "type"]
         train_df = train_df[cols]
         val_df   = val_df[cols]
         test_df  = test_df[cols]
