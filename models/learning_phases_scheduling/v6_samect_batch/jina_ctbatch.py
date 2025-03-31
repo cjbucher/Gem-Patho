@@ -1,0 +1,717 @@
+#!/usr/bin/env python
+"""
+Transformer-based survival model using preprocessed Jina embeddings,
+polyphen scores, CNA values, cancer type information, and description embeddings.
+
+Data files are assumed to be in:
+  Input k-folds:
+    /home/chb3333/yulab/chb3333/gem-patho/data_extraction/kfolds/jinaai_kfold_20val/
+Model outputs (for multiple hyperparameter experiments) will be saved in:
+  /home/chb3333/yulab/chb3333/gem-patho/models/learning_phases_scheduling/v6_samect_batch
+"""
+
+import os
+import copy
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader, Sampler
+from lifelines.utils import concordance_index  # for c-index
+from scipy.stats import pearsonr
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+import random
+import argparse
+
+# Set seeds for reproducibility
+random.seed(42)
+np.random.seed(42)
+torch.manual_seed(42)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(42)
+
+##########################################
+# Constants & Paths
+##########################################
+INPUT_DIR = "/home/chb3333/yulab/chb3333/gem-patho/data_extraction/kfolds/jinaai_kfold_20val"
+BASE_OUTPUT_DIR = "/home/chb3333/yulab/chb3333/gem-patho/models/learning_phases_scheduling/v6_samect_batch"
+NUM_FOLDS = 10
+os.makedirs(BASE_OUTPUT_DIR, exist_ok=True)
+print("Base output directory:", BASE_OUTPUT_DIR)
+
+# Cancer type mapping CSV – maps study abbreviations (e.g., "LAML") to study names.
+CANCER_TYPE_MAPPING_CSV = "/home/chb3333/yulab/chb3333/gem-patho/data_extraction/cancertype_location_description/tcga_study_abbreviations.csv"
+
+def int_to_binary_vector(x, width=6):
+    """Convert integer to a fixed-width binary vector (list of ints)."""
+    return [int(b) for b in format(x, f"0{width}b")]
+
+# Load cancer type mapping.
+df_ct = pd.read_csv(CANCER_TYPE_MAPPING_CSV)
+unique_types = sorted(df_ct["Study Abbreviation"].unique())
+cancer_type_mapping = {ct: int_to_binary_vector(i, 6) for i, ct in enumerate(unique_types)}
+print("Cancer type mapping:", cancer_type_mapping)
+
+# Build a mapping from cancer type abbreviation to a unique integer index.
+type_to_index = {ct: i for i, ct in enumerate(unique_types)}
+print("Cancer type to index mapping:", type_to_index)
+
+##########################################
+# Stratified Batch Sampler
+##########################################
+class StratifiedBatchSampler(Sampler):
+    def __init__(self, labels, batch_size, shuffle=True):
+        """
+        Args:
+            labels (list or np.array): List of labels (e.g., cancer type strings) for each sample.
+            batch_size (int): Number of samples per batch.
+            shuffle (bool): Whether to shuffle indices within each class.
+        """
+        self.labels = np.array(labels)
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.unique_labels = np.unique(self.labels)
+        self.indices_per_label = {label: np.where(self.labels == label)[0].tolist()
+                                  for label in self.unique_labels}
+        self.num_samples = len(self.labels)
+        self.num_batches = int(np.ceil(self.num_samples / self.batch_size))
+    
+    def __iter__(self):
+        indices_per_label = {label: idxs.copy() for label, idxs in self.indices_per_label.items()}
+        if self.shuffle:
+            for label in self.unique_labels:
+                np.random.shuffle(indices_per_label[label])
+        for _ in range(self.num_batches):
+            batch = []
+            for label in self.unique_labels:
+                prop = len(self.indices_per_label[label]) / self.num_samples
+                n_samples = max(1, int(prop * self.batch_size))
+                available = indices_per_label[label]
+                if len(available) < n_samples:
+                    chosen = np.random.choice(self.indices_per_label[label], n_samples, replace=True).tolist()
+                else:
+                    chosen = available[:n_samples]
+                    indices_per_label[label] = available[n_samples:]
+                batch.extend(chosen)
+            if len(batch) > self.batch_size:
+                batch = np.random.choice(batch, self.batch_size, replace=False).tolist()
+            yield batch
+
+    def __len__(self):
+        return self.num_batches
+
+##########################################
+# Cancer Type–Specific Batch Sampler (for Phase 2)
+##########################################
+class CancerTypeSpecificSampler(Sampler):
+    def __init__(self, labels, batch_size, shuffle=True):
+        """
+        Args:
+            labels: list of cancer type labels.
+            batch_size: desired batch size.
+            shuffle: whether to shuffle indices.
+        """
+        self.labels = np.array(labels)
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.unique_labels = np.unique(self.labels)
+        self.indices_per_label = {label: np.where(self.labels == label)[0].tolist() for label in self.unique_labels}
+        self.batches = self._create_batches()
+    
+    def _create_batches(self):
+        batches = []
+        for label, indices in self.indices_per_label.items():
+            if self.shuffle:
+                np.random.shuffle(indices)
+            # Create batches for this cancer type only.
+            for i in range(0, len(indices), self.batch_size):
+                batch = indices[i:i+self.batch_size]
+                batches.append(batch)
+        if self.shuffle:
+            np.random.shuffle(batches)
+        return batches
+
+    def __iter__(self):
+        # Re-create batches each iteration for randomness.
+        batches = self._create_batches()
+        for batch in batches:
+            yield batch
+
+    def __len__(self):
+        return len(self.batches)
+
+##########################################
+# Collate Function for Padding (mask removed)
+##########################################
+def collate_fn_preprocessed(batch):
+    emb_list, score_list, cna_list, cancer_type_list, desc_list, times, events, case_ids = zip(*batch)
+    padded_emb = torch.nn.utils.rnn.pad_sequence([torch.stack(seq) for seq in emb_list],
+                                                  batch_first=True, padding_value=0.0)
+    padded_scores = torch.nn.utils.rnn.pad_sequence([torch.stack(seq) for seq in score_list],
+                                                     batch_first=True, padding_value=0.0)
+    padded_cnas = torch.nn.utils.rnn.pad_sequence([torch.stack(seq) for seq in cna_list],
+                                                  batch_first=True, padding_value=0.0)
+    cancer_types = torch.stack(cancer_type_list)
+    descriptions = torch.stack(desc_list)
+    times = torch.stack(times)
+    events = torch.stack(events)
+    # No mask is generated.
+    return padded_emb, padded_scores, padded_cnas, cancer_types, descriptions, times, events, case_ids
+
+##########################################
+# Unified Loss Function (normalized by cancer type)
+##########################################
+def compute_loss(risk, times, events, cancer_type_indices, model, lambda_reg=1e-4):
+    """
+    Computes the negative log-likelihood loss for the survival model.
+    Each sample is weighted by 1/(# samples in its cancer type).
+    No masking of pairs is applied.
+    """
+    B = risk.shape[0]
+    risk = torch.clamp(risk, min=-50, max=50)
+    
+    # Compute pairwise differences.
+    diff = times.unsqueeze(0) - times.unsqueeze(1)
+    mat_A = (diff > 0).float()
+    mat_B = (diff == 0).float().triu(diagonal=1)
+    
+    exp_risk = torch.exp(risk)
+    R = torch.sum((mat_A + mat_B) * exp_risk.T, dim=1) + 1e-6
+    
+    # Normalize loss by cancer type frequency.
+    unique_labels, inv, counts = torch.unique(cancer_type_indices, return_inverse=True, return_counts=True)
+    scale = 1.0 / counts[inv].float()
+    
+    loss = -torch.mean(scale * events * (risk.squeeze() - torch.log(R)))
+    
+    # L2 regularization.
+    reg_loss = 0.0
+    for param in model.parameters():
+        reg_loss += torch.sum(param ** 2)
+    
+    loss += lambda_reg * reg_loss
+    return loss
+
+##########################################
+# Dataset for Preprocessed Sequences (Jina)
+##########################################
+class PreprocessedSequenceDataset(Dataset):
+    def __init__(self, df, token_col="gene_embed_seq", cancer_type_mapping=None):
+        """
+        Expects a DataFrame with columns:
+          - "Case ID": patient identifier.
+          - token_col: a list/array of tokens (each token is a dict with keys: "gene", "embedding", "score", "cna").
+          - "OS.time": survival time.
+          - "OS": event indicator.
+          - "type": cancer type abbreviation.
+          Optionally, if present, "description_embeddings" will be used as a separate token.
+        """
+        self.df = df.reset_index(drop=True)
+        self.token_col = token_col
+        self.cancer_type_mapping = cancer_type_mapping if cancer_type_mapping is not None else {}
+        self.has_description = "description_embeddings" in self.df.columns
+
+        self.genename_dim = None
+        for idx in range(len(self.df)):
+            tokens = self.df.iloc[idx][token_col]
+            if isinstance(tokens, np.ndarray):
+                tokens = tokens.tolist()
+            if tokens and len(tokens) > 0:
+                self.genename_dim = len(tokens[0]["embedding"])
+                break
+        if self.genename_dim is None:
+            raise ValueError("Could not determine gene embedding dimension from data.")
+
+        self.default_token_count = 0
+        for idx in range(len(self.df)):
+            tokens = self.df.iloc[idx][token_col]
+            if isinstance(tokens, np.ndarray):
+                tokens = tokens.tolist()
+            if not tokens or (hasattr(tokens, '__len__') and len(tokens) == 0):
+                self.default_token_count += 1
+        total_samples = len(self.df)
+        default_percentage = (self.default_token_count / total_samples) * 100
+        print(f"Samples with default tokens: {self.default_token_count} ({default_percentage:.2f}% of {total_samples} samples)")
+        
+    def __len__(self):
+        return len(self.df)
+    
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        tokens = row[self.token_col]
+        if isinstance(tokens, np.ndarray):
+            tokens = tokens.tolist()
+        if not tokens or (hasattr(tokens, '__len__') and len(tokens) == 0):
+            tokens = [{"gene": "", "embedding": [0.0]*self.genename_dim, "score": 0.0, "cna": 0.0}]
+        embeddings = [torch.tensor(token["embedding"], dtype=torch.float) for token in tokens]
+        scores = [torch.tensor(token["score"], dtype=torch.float) for token in tokens]
+        cnas = [torch.tensor(token.get("cna", 0.0), dtype=torch.float) for token in tokens]
+        
+        cancer_type_acronym = row.get("type", None)
+        if cancer_type_acronym is None or cancer_type_acronym not in self.cancer_type_mapping:
+            ct_vector = [0]*6
+        else:
+            ct_vector = self.cancer_type_mapping[cancer_type_acronym]
+        cancer_type_tensor = torch.tensor(ct_vector, dtype=torch.float)
+        
+        if self.has_description:
+            description = torch.tensor(row["description_embeddings"], dtype=torch.float)
+        else:
+            print("No description embedding found for sample, using zero vector.")
+            description = torch.zeros(self.genename_dim, dtype=torch.float)
+        
+        time = torch.tensor(row["OS.time"], dtype=torch.float)
+        event = torch.tensor(row["OS"], dtype=torch.float)
+        case_id = row.get("Case ID", "Unknown")
+        return embeddings, scores, cnas, cancer_type_tensor, description, time, event, case_id
+
+##########################################
+# Transformer Survival Model (with Description Token)
+##########################################
+class PreprocessedTransformerSurvivalModel(nn.Module):
+    def __init__(self, d_gene, d_model=256, polyphen_hidden_dim=128, nhead=4, dropout=0.1, desc_dim=None):
+        """
+        d_gene: dimension of the gene embedding.
+        d_model: token dimension.
+        polyphen_hidden_dim: hidden dimension for polyphen, CNA, and cancer type MLPs.
+        desc_dim: dimension of description embeddings; if None, assumed equal to d_gene.
+        """
+        super(PreprocessedTransformerSurvivalModel, self).__init__()
+        self.gene_linear = nn.Linear(d_gene, d_model)
+        self.polyphen_mlp = nn.Sequential(
+            nn.Linear(1, polyphen_hidden_dim),
+            nn.GELU(),
+            nn.Linear(polyphen_hidden_dim, d_model)
+        )
+        self.cna_mlp = nn.Sequential(
+            nn.Linear(1, polyphen_hidden_dim),
+            nn.GELU(),
+            nn.Linear(polyphen_hidden_dim, d_model)
+        )
+        self.cancer_type_mlp = nn.Sequential(
+            nn.Linear(6, polyphen_hidden_dim),
+            nn.GELU(),
+            nn.Linear(polyphen_hidden_dim, d_model)
+        )
+        if desc_dim is None:
+            desc_dim = d_gene
+        self.description_linear = nn.Linear(desc_dim, d_model)
+        
+        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead,
+                                                    dropout=dropout, activation="gelu")
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=2)
+        self.final_linear = nn.Linear(d_model, 1)
+        
+    def forward(self, emb, scores, cnas, cancer_type, description):
+        gene_proj = self.gene_linear(emb)
+        polyphen_proj = self.polyphen_mlp(scores.unsqueeze(-1))
+        cna_proj = self.cna_mlp(cnas.unsqueeze(-1))
+        cancer_type_proj = self.cancer_type_mlp(cancer_type).unsqueeze(1)
+        token_emb = gene_proj + polyphen_proj + cna_proj + cancer_type_proj
+        
+        desc_proj = self.description_linear(description).unsqueeze(1)
+        token_emb = torch.cat([desc_proj, token_emb], dim=1)
+        
+        token_emb = token_emb.transpose(0, 1)
+        transformer_out = self.transformer_encoder(token_emb)
+        transformer_out = transformer_out.transpose(0, 1)
+        pooled = transformer_out[:, 0, :]
+        risk = self.final_linear(pooled)
+        return risk
+
+##########################################
+# Evaluation Function
+##########################################
+def evaluate_model(model, dataloader, device):
+    model.eval()
+    all_T, all_E, all_risk, all_ct, all_case_ids = [], [], [], [], []
+    losses = []
+    missing_cancer_types = []  # To record cancer types with insufficient pairs for c-index computation
+    with torch.no_grad():
+        for emb_batch, score_batch, cna_batch, cancer_type_batch, desc_batch, T_batch, E_batch, case_ids in dataloader:
+            emb_batch = emb_batch.to(device)
+            score_batch = score_batch.to(device)
+            cna_batch = cna_batch.to(device)
+            cancer_type_batch = cancer_type_batch.to(device)
+            desc_batch = desc_batch.to(device)
+            T_batch = T_batch.to(device)
+            E_batch = E_batch.to(device)
+            
+            risk = model(emb_batch, score_batch, cna_batch, cancer_type_batch, desc_batch)
+            
+            # Convert binary cancer type vector back to an integer label.
+            ct_idx_list = []
+            for ct_tensor in cancer_type_batch:
+                ct_list = ct_tensor.cpu().tolist()
+                found = False
+                for key, binary_vec in cancer_type_mapping.items():
+                    if binary_vec == [int(x) for x in ct_list]:
+                        ct_idx_list.append(type_to_index[key])
+                        found = True
+                        break
+                if not found:
+                    ct_idx_list.append(-1)
+            ct_idx = torch.tensor(ct_idx_list, device=device)
+            
+            loss = compute_loss(risk, T_batch, E_batch, ct_idx, model)
+            losses.append(loss.item())
+            all_T.append(T_batch.cpu().numpy())
+            all_E.append(E_batch.cpu().numpy())
+            all_risk.append(risk.cpu().numpy())
+            all_ct.append(ct_idx.cpu().numpy())
+            all_case_ids.extend(case_ids)
+    avg_loss = np.mean(losses)
+    all_T = np.concatenate(all_T).squeeze()
+    all_E = np.concatenate(all_E).squeeze()
+    all_risk = np.concatenate(all_risk).squeeze()
+    all_ct = np.concatenate(all_ct).squeeze()
+    global_cindex = concordance_index(all_T, -all_risk, all_E)
+    
+    # Compute per-cancer type c-index.
+    cindex_by_type = {}
+    normalized_values = []
+    unique_cts = np.unique(all_ct)
+    for ct in unique_cts:
+        mask_ct = (all_ct == ct)
+        n = np.sum(mask_ct)
+        if n < 2:
+            c_idx = np.nan
+            missing_cancer_types.append(int(ct))
+        else:
+            admissible_pairs = 0
+            T_subset = all_T[mask_ct]
+            E_subset = all_E[mask_ct]
+            for i in range(n):
+                for j in range(i+1, n):
+                    if T_subset[i] != T_subset[j] and (E_subset[i] == 1 or E_subset[j] == 1):
+                        admissible_pairs += 1
+            if admissible_pairs == 0:
+                c_idx = np.nan
+                missing_cancer_types.append(int(ct))
+            else:
+                c_idx = concordance_index(all_T[mask_ct], -all_risk[mask_ct], all_E[mask_ct])
+        cindex_by_type[int(ct)] = c_idx
+        if not np.isnan(c_idx):
+            normalized_values.append(c_idx)
+    normalized_avg_cindex = np.mean(normalized_values) if normalized_values else np.nan
+    
+    return avg_loss, global_cindex, cindex_by_type, normalized_avg_cindex, all_T, all_risk, all_ct, all_case_ids, missing_cancer_types
+
+##########################################
+# Phase Scheduler (for switching batching strategy)
+##########################################
+class PhaseScheduler:
+    def __init__(self, warmup=10):
+        self.warmup = warmup
+        
+    def get_phase(self, epoch):
+        # Phase 0: first `warmup` epochs; Phase 2: thereafter.
+        if epoch < self.warmup:
+            return 0
+        return 2
+
+##########################################
+# Training Function (with cancer type specific batching in Phase 2)
+##########################################
+def train_model_fn(train_loader, val_loader, model, device, max_epochs=100, patience=20,
+                   warmup=10, batch_size=524):
+    optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
+    scheduler = PhaseScheduler(warmup=warmup)
+
+    history = []
+    best_val_loss = float('inf')
+    best_cindex = 0.0
+    best_epoch = 0
+    epochs_no_improve = 0
+    best_model_state = copy.deepcopy(model.state_dict())
+    current_loader = train_loader  # start with the stratified loader
+    old_phase = -1 
+
+    for epoch in range(1, max_epochs+1):
+        model.train()
+        phase = scheduler.get_phase(epoch)
+        
+        # When transitioning to Phase 2, switch to cancer type–specific batching.
+        if phase == 2 and old_phase != 2:
+            print("Switching to cancer type specific batching for phase 2")
+            labels = train_loader.dataset.df["type"].tolist()
+            cancer_sampler = CancerTypeSpecificSampler(labels, batch_size, shuffle=True)
+            current_loader = DataLoader(train_loader.dataset, batch_sampler=cancer_sampler, collate_fn=collate_fn_preprocessed)
+        old_phase = phase
+
+        train_losses = []
+        for emb_batch, score_batch, cna_batch, cancer_type_batch, desc_batch, T_batch, E_batch, _ in current_loader:
+            emb_batch = emb_batch.to(device)
+            score_batch = score_batch.to(device)
+            cna_batch = cna_batch.to(device)
+            cancer_type_batch = cancer_type_batch.to(device)
+            desc_batch = desc_batch.to(device)
+            T_batch = T_batch.to(device)
+            E_batch = E_batch.to(device)
+            
+            # Convert binary cancer type vector to integer indices.
+            ct_idx_list = []
+            for ct_tensor in cancer_type_batch:
+                ct_list = ct_tensor.cpu().tolist()
+                found = False
+                for key, binary_vec in cancer_type_mapping.items():
+                    if binary_vec == [int(x) for x in ct_list]:
+                        ct_idx_list.append(type_to_index[key])
+                        found = True
+                        break
+                if not found:
+                    ct_idx_list.append(-1)
+            ct_idx = torch.tensor(ct_idx_list, device=device)
+            
+            optimizer.zero_grad()
+            risk = model(emb_batch, score_batch, cna_batch, cancer_type_batch, desc_batch)
+            loss = compute_loss(risk, T_batch, E_batch, ct_idx, model)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            train_losses.append(loss.item())
+        
+        if not train_losses:
+            break
+        train_loss_epoch = np.mean(train_losses)
+        val_loss, val_cindex_global, val_cindex_by_type, normalized_avg_cindex, _, _, _, _, _ = evaluate_model(
+            model, val_loader, device)
+        history.append({
+            "epoch": epoch,
+            "train_loss": train_loss_epoch,
+            "val_loss": val_loss,
+            "val_cindex_global": val_cindex_global,
+            "normalized_avg_cindex": normalized_avg_cindex,
+            "val_cindex_by_type": val_cindex_by_type
+        })
+
+        print(f"Epoch {epoch:02d}: Train Loss = {train_loss_epoch:.4f}, Val Loss = {val_loss:.4f}, Global Val C-index = {val_cindex_global:.4f}, Normalized Val C-index = {normalized_avg_cindex:.4f}")
+        
+        if val_loss < best_val_loss or val_cindex_global > best_cindex:
+            best_val_loss = min(best_val_loss, val_loss)
+            best_cindex = max(best_cindex, val_cindex_global)
+            best_epoch = epoch
+            best_model_state = copy.deepcopy(model.state_dict())
+            epochs_no_improve = 0
+        else:
+            epochs_no_improve += 1
+        if epochs_no_improve >= patience:
+            print("Early stopping at epoch", epoch)
+            break
+    model.load_state_dict(best_model_state)
+    return model, best_epoch, best_val_loss, history
+
+##########################################
+# Plotting Function
+##########################################
+def plot_history(history, save_dir, fold, warmup=None):
+    h_df = pd.DataFrame(history)
+    
+    plt.figure(figsize=(10,5))
+    plt.plot(h_df['epoch'], h_df['val_cindex_global'], label='Global Val C-index')
+    plt.xlabel('Epoch')
+    plt.ylabel('C-index')
+    plt.title(f'Global Val C-index - Fold {fold}')
+    if warmup is not None:
+        plt.axvline(x=warmup, color='red', linestyle='--', label='Phase 0→2 Transition')
+    plt.legend()
+    global_cindex_path = os.path.join(save_dir, f'global_cindex_fold_{fold}.png')
+    plt.savefig(global_cindex_path)
+    plt.close()
+    
+    all_types = set()
+    for d in h_df['val_cindex_by_type']:
+        all_types.update(d.keys())
+    all_types = sorted(list(all_types))
+    
+    plt.figure(figsize=(10,5))
+    for ct in all_types:
+        values = [d.get(ct, np.nan) for d in h_df['val_cindex_by_type']]
+        plt.plot(h_df['epoch'], values, label=f'Cancer type {ct}')
+    plt.plot(h_df['epoch'], h_df['normalized_avg_cindex'], label='Normalized Avg', linewidth=2, linestyle='--')
+    plt.xlabel('Epoch')
+    plt.ylabel('C-index')
+    plt.title(f'Per-Cancer-Type Val C-index - Fold {fold}')
+    if warmup is not None:
+        plt.axvline(x=warmup, color='red', linestyle='--', label='Phase 0→2 Transition')
+    plt.legend()
+    per_type_cindex_path = os.path.join(save_dir, f'per_type_cindex_fold_{fold}.png')
+    plt.savefig(per_type_cindex_path)
+    plt.close()
+    
+    history_save_path = os.path.join(save_dir, "history_data.csv")
+    h_df.to_csv(history_save_path, index=False)
+    print(f"Saved plots and history for fold {fold} in {save_dir}")
+
+##########################################
+# Main Training Loop Over Experiments and Folds
+##########################################
+all_experiment_results = []
+
+def main():
+    parser = argparse.ArgumentParser(description="Run one experiment and one k-fold job.")
+    parser.add_argument("--job_idx", type=int, required=True,
+                        help="Global job index (0-indexed) for experiment-fold combination.")
+    args = parser.parse_args()
+
+    experiment_idx = args.job_idx // NUM_FOLDS
+    fold = (args.job_idx % NUM_FOLDS) + 1
+
+    print(f"Global job index: {args.job_idx}")
+    print(f"Selected experiment index: {experiment_idx}")
+    print(f"Selected fold: {fold}")
+
+    if not torch.cuda.is_available():
+        print("No GPU available.")
+
+    # Experiments configuration (using unified loss).
+    experiments = [
+        {"warmup": 0},
+        {"warmup": 10},
+    ]
+
+    if experiment_idx < 0 or experiment_idx >= len(experiments):
+        raise ValueError(f"Invalid experiment index: {experiment_idx}.")
+    
+    exp = experiments[experiment_idx]
+    print(f"Running experiment {experiment_idx}: {exp}")
+
+    cols = ["Case ID", "gene_embed_seq", "OS.time", "OS", "type", "description_embeddings"]
+
+    fold_folder = os.path.join(INPUT_DIR, f"fold_{fold}")
+    train_path = os.path.join(fold_folder, "train.parquet")
+    val_path = os.path.join(fold_folder, "val.parquet")
+    test_path = os.path.join(fold_folder, "test.parquet")
+    train_df = pd.read_parquet(train_path, engine="pyarrow")[cols]
+    val_df = pd.read_parquet(val_path, engine="pyarrow")[cols]
+    test_df = pd.read_parquet(test_path, engine="pyarrow")[cols]
+
+    train_dataset = PreprocessedSequenceDataset(train_df, token_col="gene_embed_seq", cancer_type_mapping=cancer_type_mapping)
+    val_dataset = PreprocessedSequenceDataset(val_df, token_col="gene_embed_seq", cancer_type_mapping=cancer_type_mapping)
+    test_dataset = PreprocessedSequenceDataset(test_df, token_col="gene_embed_seq", cancer_type_mapping=cancer_type_mapping)
+
+    batch_size = 64
+    train_labels = train_df['type'].tolist()
+    strat_sampler = StratifiedBatchSampler(train_labels, batch_size, shuffle=True)
+    train_loader = DataLoader(train_dataset, batch_sampler=strat_sampler, collate_fn=collate_fn_preprocessed)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn_preprocessed)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn_preprocessed)
+
+    sample_emb, sample_scores, sample_cnas, sample_cancer_type, sample_desc, sample_time, sample_event, _ = next(iter(train_loader))
+    d_gene = sample_emb.shape[-1]
+
+    model = PreprocessedTransformerSurvivalModel(d_gene=d_gene, d_model=256,
+                                                   polyphen_hidden_dim=128, nhead=4, dropout=0.1,
+                                                   desc_dim=sample_desc.shape[-1])
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    model.to(device)
+    print(f"Training model for Experiment {experiment_idx}, Fold {fold}")
+    model, best_epoch, best_val_loss, history = train_model_fn(
+        train_loader, val_loader, model, device, max_epochs=100, patience=20,
+        warmup=exp["warmup"],
+        batch_size=batch_size
+    )
+
+    # Save epoch c-indices (global, normalized avg, and per cancer type) into a CSV.
+    cindices_records = []
+    for record in history:
+        epoch = record['epoch']
+        # Global and normalized average indices.
+        cindices_records.append({
+            "epoch": epoch,
+            "cancer_type": "global",
+            "c_index": record['val_cindex_global']
+        })
+        cindices_records.append({
+            "epoch": epoch,
+            "cancer_type": "normalized_avg",
+            "c_index": record['normalized_avg_cindex']
+        })
+        # Per cancer type.
+        for ct, c_idx in record['val_cindex_by_type'].items():
+            cindices_records.append({
+                "epoch": epoch,
+                "cancer_type": ct,
+                "c_index": c_idx
+            })
+    df_cindices = pd.DataFrame(cindices_records)
+    cindices_csv_path = os.path.join(fold_folder, f"fold_{fold}", "epoch_cindices.csv")
+    os.makedirs(os.path.join(fold_folder, f"fold_{fold}"), exist_ok=True)
+    df_cindices.to_csv(cindices_csv_path, index=False)
+    print(f"Saved epoch c-indices to {cindices_csv_path}")
+
+    exp_dir = os.path.join(BASE_OUTPUT_DIR, f"cancertypebatching_exp_{experiment_idx}_warmup_{exp['warmup']}")
+    os.makedirs(exp_dir, exist_ok=True)
+    fold_dir = os.path.join(exp_dir, f"fold_{fold}")
+    os.makedirs(fold_dir, exist_ok=True)
+    model_save_path = os.path.join(fold_dir, f"best_model_fold_{fold}.pth")
+    torch.save(model.state_dict(), model_save_path)
+    print(f"Saved best model for Fold {fold} to {model_save_path}")
+
+    # Evaluate and save risk predictions for train and val splits.
+    for split, loader, prefix in zip(["train", "val"], [train_loader, val_loader], ["train", "val"]):
+        avg_loss, global_cindex, cindex_by_type, normalized_avg_cindex, all_T, all_risk, all_ct, all_case_ids, missing_ct = evaluate_model(model, loader, device)
+        df_out = pd.DataFrame({
+            "Case ID": all_case_ids,
+            "OS.time": all_T,
+            "risk": all_risk,
+            "cancer_type": all_ct,  # integer label from our mapping
+            "split": prefix
+        })
+        out_path = os.path.join(fold_dir, f"{prefix}_risk_scores.csv")
+        df_out.to_csv(out_path, index=False)
+        print(f"Saved {prefix} risk scores to {out_path}")
+        missing_df = pd.DataFrame({"Missing Cancer Types": missing_ct})
+        missing_out_path = os.path.join(fold_dir, f"{prefix}_missing_cancer_types.csv")
+        missing_df.to_csv(missing_out_path, index=False)
+        print(f"Saved missing cancer types for {prefix} split to {missing_out_path}")
+
+    train_loss, train_cindex, _, _, _, _, _, _, _ = evaluate_model(model, train_loader, device)
+    val_loss, val_cindex_global, _, normalized_avg_cindex, _, _, _, _, _ = evaluate_model(model, val_loader, device)
+    test_loss, test_cindex, test_T, test_risk, _, _, _, _, _ = evaluate_model(model, test_loader, device)
+    risk_mean = np.mean(test_risk)
+    risk_std = np.std(test_risk)
+    try:
+        corr, _ = pearsonr(test_T, test_risk)
+    except Exception as e:
+        print("Pearson correlation error:", e)
+        corr = np.nan
+
+    fold_metrics = {
+        "fold": fold,
+        "best_epoch": best_epoch,
+        "best_val_loss": best_val_loss,
+        "train_loss": train_loss,
+        "train_cindex": train_cindex,
+        "val_loss": val_loss,
+        "val_cindex_global": val_cindex_global,
+        "normalized_val_cindex": normalized_avg_cindex,
+        "test_loss": test_loss,
+        "test_cindex": test_cindex,
+        "test_risk_mean": risk_mean,
+        "test_risk_std": risk_std,
+        "test_risk_OS_corr": corr
+    }
+    pd.DataFrame([fold_metrics]).to_csv(os.path.join(fold_dir, "fold_metrics.csv"), index=False)
+    history_df = pd.DataFrame(history)
+    history_save_path = os.path.join(fold_dir, "history_fold.csv")
+    history_df.to_csv(history_save_path, index=False)
+    plot_history(history, fold_dir, fold, warmup=exp["warmup"])
+
+    exp_metrics_df = pd.DataFrame([fold_metrics])
+    exp_metrics_path = os.path.join(exp_dir, "experiment_fold_metrics.csv")
+    exp_metrics_df.to_csv(exp_metrics_path, index=False)
+    exp_summary = exp_metrics_df.mean(numeric_only=True).to_dict()
+    exp_summary.update(exp)
+    all_experiment_results.append(exp_summary)
+
+    summary_df = pd.DataFrame(all_experiment_results)
+    summary_csv_path = os.path.join(BASE_OUTPUT_DIR, "all_experiments_summary.csv")
+    summary_df.to_csv(summary_csv_path, index=False)
+    print(f"\nSaved experiment summary to {summary_csv_path}")
+
+if __name__ == "__main__":
+    main()

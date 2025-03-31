@@ -1,0 +1,2 @@
+fold,best_epoch,best_val_loss,train_loss,train_cindex,val_loss,val_cindex_global,normalized_val_cindex,test_loss,test_cindex,test_risk_mean,test_risk_std,test_risk_OS_corr
+3,98,0.25040191784501076,0.23095808823903402,0.7464045855890552,0.2533443383872509,0.7287007458756531,0.5687344650358548,0.20575135946273804,0.7183304665212283,0.5805448157352157,0.0,

@@ -27,7 +27,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import torch.nn.functional as F
+import torch.nn.functional as F 
 from torch.utils.data import Dataset, DataLoader
 from lifelines.utils import concordance_index  # for c-index
 from scipy.stats import pearsonr
@@ -127,7 +127,7 @@ class ImageFeatureExtractor(nn.Module):
         attn_weights = self.attention(med_feat)  # (N, 1)
         attn_weights = torch.softmax(attn_weights, dim=0)  # softmax over N patches
         # Weighted sum over the patch features.
-        afeat = torch.sum(attn_weights * med_feat, dim=0)  # (D_inner,)
+        afeat = torch.sum(attn_weights * med_feat, dim=0)  # (D_inner,) applies attention score across the N patches - collapses N dimensions
         if self.dropout is not None:
             afeat = self.dropout(afeat)
         out = self.classifier(afeat)  # (D_out,)

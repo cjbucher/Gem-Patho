@@ -404,20 +404,30 @@ def plot_history(history, save_dir, fold):
 ##########################################
 # Main Training Loop Over Experiments and Folds
 ##########################################
+NUM_FOLDS = 10
 
 all_experiment_results = []
 
 def main():
     # Parse command-line arguments.
-    parser = argparse.ArgumentParser(description="Run hyperparameter experiment job.")
+    parser = argparse.ArgumentParser(description="Run one experiment and one k-fold job.")
     parser.add_argument("--job_idx", type=int, required=True,
-                        help="Index of the experiment to run (0-indexed).")
+                        help="Global job index (0-indexed) for experiment-fold combination.")
     args = parser.parse_args()
 
+    # Compute experiment and fold indices from the global job index.
+    experiment_idx = args.job_idx // NUM_FOLDS
+    fold = (args.job_idx % NUM_FOLDS) + 1  # Folds numbered 1 through 10
+
+    print(f"Global job index: {args.job_idx}")
+    print(f"Selected experiment index: {experiment_idx}")
+    print(f"Selected fold: {fold}")
+
     if not torch.cuda.is_available():
-        print("Error: No GPU available. Exiting.")
-        import sys
-        sys.exit(1)
+        print("No GPU available.")
+        # If you want to continue on CPU, you may remove the exit or leave it commented out.
+        # import sys
+        # sys.exit(1)
 
     # Define hyperparameter experiments.
     experiments = [
@@ -426,137 +436,136 @@ def main():
         {"transition_percentage": 0.9, "final_percentage": 0.8, "warmup": 5,  "transition": 10},
         {"transition_percentage": 0.9, "final_percentage": 0.8, "warmup": 20, "transition": 10},
         {"transition_percentage": 0.9, "final_percentage": 0.9, "warmup": 10, "transition": 10},
+
         {"transition_percentage": 0.9, "final_percentage": 0.9, "warmup": 10, "transition": 10},
         {"transition_percentage": 0.9, "final_percentage": 0.9, "warmup": 15, "transition": 15},
         {"transition_percentage": 0.9, "final_percentage": 0.9, "warmup": 5,  "transition": 10},
         {"transition_percentage": 0.9, "final_percentage": 0.9, "warmup": 20, "transition": 10},
         {"transition_percentage": 1.0, "final_percentage": 0.8, "warmup": 10, "transition": 10},
+
         {"transition_percentage": 1.0, "final_percentage": 0.8, "warmup": 10, "transition": 10},
         {"transition_percentage": 1.0, "final_percentage": 0.8, "warmup": 15, "transition": 15},
         {"transition_percentage": 1.0, "final_percentage": 0.8, "warmup": 5,  "transition": 10},
         {"transition_percentage": 1.0, "final_percentage": 0.8, "warmup": 20, "transition": 10},
         {"transition_percentage": 0.8, "final_percentage": 0.9, "warmup": 10, "transition": 10},
+
         {"transition_percentage": 0.8, "final_percentage": 0.9, "warmup": 10, "transition": 10},
         {"transition_percentage": 0.8, "final_percentage": 0.9, "warmup": 15, "transition": 15},
         {"transition_percentage": 0.8, "final_percentage": 0.9, "warmup": 5,  "transition": 10},
         {"transition_percentage": 0.8, "final_percentage": 0.9, "warmup": 20, "transition": 10},
         {"transition_percentage": 0.95, "final_percentage": 0.9, "warmup": 10, "transition": 10},
+
         {"transition_percentage": 0.95, "final_percentage": 0.9, "warmup": 10, "transition": 10},
         {"transition_percentage": 0.95, "final_percentage": 0.9, "warmup": 15, "transition": 15},
         {"transition_percentage": 0.95, "final_percentage": 0.9, "warmup": 5,  "transition": 10},
         {"transition_percentage": 0.95, "final_percentage": 0.9, "warmup": 20, "transition": 10},
     ]
-    
-    # Ensure the provided job index is valid.
-    if args.job_idx < 0 or args.job_idx >= len(experiments):
-        raise ValueError("Please provide a valid --job_idx between 0 and {}.".format(len(experiments) - 1))
-    
-    # Select only the experiment corresponding to the provided index.
-    exp_idx = args.job_idx
-    exp = experiments[exp_idx]
-    print(f"Running experiment {exp_idx}: {exp}")
-    
+
+    # Check that the experiment index is valid.
+    if experiment_idx < 0 or experiment_idx >= len(experiments):
+        raise ValueError(f"Invalid experiment index: {experiment_idx}. Must be between 0 and {len(experiments)-1}.")
+
+    # Select the experiment corresponding to the computed experiment index.
+    exp = experiments[experiment_idx]
+    print(f"Running experiment {experiment_idx}: {exp}")
+
     # Create output directory for this experiment.
     exp_dir = os.path.join(BASE_OUTPUT_DIR,
-        f"exp_{exp_idx}_tp_{exp['transition_percentage']}_fp_{exp['final_percentage']}_warmup_{exp['warmup']}_transition_{exp['transition']}")
+        f"exp_{experiment_idx}_tp_{exp['transition_percentage']}_fp_{exp['final_percentage']}_warmup_{exp['warmup']}_transition_{exp['transition']}")
     os.makedirs(exp_dir, exist_ok=True)
-    exp_fold_metrics = []
-    
-    # Loop over folds.
-    for fold in range(1, NUM_FOLDS+1):
-        print(f"\n--- Processing Fold {fold} for Experiment {exp_idx} ---")
-        fold_dir = os.path.join(exp_dir, f"fold_{fold}")
-        os.makedirs(fold_dir, exist_ok=True)
-        
-        # Load data.
-        fold_folder = os.path.join(INPUT_DIR, f"fold_{fold}")
-        train_path = os.path.join(fold_folder, "train.parquet")
-        val_path   = os.path.join(fold_folder, "val.parquet")
-        test_path  = os.path.join(fold_folder, "test.parquet")
-        train_df = pd.read_parquet(train_path, engine="pyarrow")
-        val_df   = pd.read_parquet(val_path, engine="pyarrow")
-        test_df  = pd.read_parquet(test_path, engine="pyarrow")
-        cols = ["gene_embed_seq", "OS.time", "OS", "type", "description_embeddings"]
-        train_df = train_df[cols]
-        val_df   = val_df[cols]
-        test_df  = test_df[cols]
-        
-        train_dataset = PreprocessedSequenceDataset(train_df, token_col="gene_embed_seq", cancer_type_mapping=cancer_type_mapping)
-        val_dataset   = PreprocessedSequenceDataset(val_df, token_col="gene_embed_seq", cancer_type_mapping=cancer_type_mapping)
-        test_dataset  = PreprocessedSequenceDataset(test_df, token_col="gene_embed_seq", cancer_type_mapping=cancer_type_mapping)
-        
-        batch_size = 32
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn_preprocessed)
-        val_loader   = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn_preprocessed)
-        test_loader  = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn_preprocessed)
-        
-        sample_emb, sample_scores, sample_cnas, sample_cancer_type, sample_desc, sample_time, sample_event, sample_mask = next(iter(train_loader))
-        d_gene = sample_emb.shape[-1]
-        
-        model = PreprocessedTransformerSurvivalModel(d_gene=d_gene, d_model=256,
-                                                        polyphen_hidden_dim=128, nhead=4, dropout=0.1,
-                                                        desc_dim=sample_desc.shape[-1])
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        print(device)
-        model.to(device)
-        print(f"Training model for Experiment {exp_idx}, Fold {fold}")
-        model, best_epoch, best_val_loss, history = train_model_fn(
-            train_loader, val_loader, model, device, max_epochs=100, patience=20,
-            transition_percentage=exp["transition_percentage"],
-            final_percentage=exp["final_percentage"],
-            warmup=exp["warmup"],
-            transition=exp["transition"]
-        )
-        model_save_path = os.path.join(fold_dir, f"best_model_fold_{fold}.pth")
-        torch.save(model.state_dict(), model_save_path)
-        print(f"Saved best model for Fold {fold} to {model_save_path}")
-        
-        train_loss, train_cindex, _, _ = evaluate_model(model, train_loader, device,
-                                                        final_percentage=exp["final_percentage"])
-        val_loss, val_cindex, _, _ = evaluate_model(model, val_loader, device,
+
+    # Process only the selected fold.
+    print(f"\n--- Processing Fold {fold} for Experiment {experiment_idx} ---")
+    fold_dir = os.path.join(exp_dir, f"fold_{fold}")
+    os.makedirs(fold_dir, exist_ok=True)
+
+    # Load data for the specific fold.
+    fold_folder = os.path.join(INPUT_DIR, f"fold_{fold}")
+    train_path = os.path.join(fold_folder, "train.parquet")
+    val_path   = os.path.join(fold_folder, "val.parquet")
+    test_path  = os.path.join(fold_folder, "test.parquet")
+    train_df = pd.read_parquet(train_path, engine="pyarrow")
+    val_df   = pd.read_parquet(val_path, engine="pyarrow")
+    test_df  = pd.read_parquet(test_path, engine="pyarrow")
+    cols = ["gene_embed_seq", "OS.time", "OS", "type", "description_embeddings"]
+    train_df = train_df[cols]
+    val_df   = val_df[cols]
+    test_df  = test_df[cols]
+
+    train_dataset = PreprocessedSequenceDataset(train_df, token_col="gene_embed_seq", cancer_type_mapping=cancer_type_mapping)
+    val_dataset   = PreprocessedSequenceDataset(val_df, token_col="gene_embed_seq", cancer_type_mapping=cancer_type_mapping)
+    test_dataset  = PreprocessedSequenceDataset(test_df, token_col="gene_embed_seq", cancer_type_mapping=cancer_type_mapping)
+
+    batch_size = 32
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn_preprocessed)
+    val_loader   = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn_preprocessed)
+    test_loader  = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn_preprocessed)
+
+    sample_emb, sample_scores, sample_cnas, sample_cancer_type, sample_desc, sample_time, sample_event, sample_mask = next(iter(train_loader))
+    d_gene = sample_emb.shape[-1]
+
+    model = PreprocessedTransformerSurvivalModel(d_gene=d_gene, d_model=256,
+                                                   polyphen_hidden_dim=128, nhead=4, dropout=0.1,
+                                                   desc_dim=sample_desc.shape[-1])
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    model.to(device)
+    print(f"Training model for Experiment {experiment_idx}, Fold {fold}")
+    model, best_epoch, best_val_loss, history = train_model_fn(
+        train_loader, val_loader, model, device, max_epochs=100, patience=20,
+        transition_percentage=exp["transition_percentage"],
+        final_percentage=exp["final_percentage"],
+        warmup=exp["warmup"],
+        transition=exp["transition"]
+    )
+    model_save_path = os.path.join(fold_dir, f"best_model_fold_{fold}.pth")
+    torch.save(model.state_dict(), model_save_path)
+    print(f"Saved best model for Fold {fold} to {model_save_path}")
+
+    train_loss, train_cindex, _, _ = evaluate_model(model, train_loader, device,
                                                     final_percentage=exp["final_percentage"])
-        test_loss, test_cindex, test_T, test_risk = evaluate_model(model, test_loader, device,
-                                                                    final_percentage=exp["final_percentage"])
-        risk_mean = np.mean(test_risk)
-        risk_std = np.std(test_risk)
-        try:
-            corr, _ = pearsonr(test_T, test_risk)
-        except Exception as e:
-            print("Pearson correlation error:", e)
-            corr = np.nan
-        
-        fold_metrics = {
-            "fold": fold,
-            "best_epoch": best_epoch,
-            "best_val_loss": best_val_loss,
-            "train_loss": train_loss,
-            "train_cindex": train_cindex,
-            "val_loss": val_loss,
-            "val_cindex": val_cindex,
-            "test_loss": test_loss,
-            "test_cindex": test_cindex,
-            "test_risk_mean": risk_mean,
-            "test_risk_std": risk_std,
-            "test_risk_OS_corr": corr
-        }
-        exp_fold_metrics.append(fold_metrics)
-        pd.DataFrame([fold_metrics]).to_csv(os.path.join(fold_dir, "fold_metrics.csv"), index=False)
-        history_df = pd.DataFrame(history)
-        history_save_path = os.path.join(fold_dir, "history_fold.csv")
-        history_df.to_csv(history_save_path, index=False)
-        plot_history(history, fold_dir, fold)
-        
-        del train_loader, val_loader, test_loader
-    
-    # Save experiment-level metrics across folds.
-    exp_metrics_df = pd.DataFrame(exp_fold_metrics)
+    val_loss, val_cindex, _, _ = evaluate_model(model, val_loader, device,
+                                                final_percentage=exp["final_percentage"])
+    test_loss, test_cindex, test_T, test_risk = evaluate_model(model, test_loader, device,
+                                                                final_percentage=exp["final_percentage"])
+    risk_mean = np.mean(test_risk)
+    risk_std = np.std(test_risk)
+    try:
+        corr, _ = pearsonr(test_T, test_risk)
+    except Exception as e:
+        print("Pearson correlation error:", e)
+        corr = np.nan
+
+    fold_metrics = {
+        "fold": fold,
+        "best_epoch": best_epoch,
+        "best_val_loss": best_val_loss,
+        "train_loss": train_loss,
+        "train_cindex": train_cindex,
+        "val_loss": val_loss,
+        "val_cindex": val_cindex,
+        "test_loss": test_loss,
+        "test_cindex": test_cindex,
+        "test_risk_mean": risk_mean,
+        "test_risk_std": risk_std,
+        "test_risk_OS_corr": corr
+    }
+    # Save the metrics for this fold.
+    pd.DataFrame([fold_metrics]).to_csv(os.path.join(fold_dir, "fold_metrics.csv"), index=False)
+    history_df = pd.DataFrame(history)
+    history_save_path = os.path.join(fold_dir, "history_fold.csv")
+    history_df.to_csv(history_save_path, index=False)
+    plot_history(history, fold_dir, fold)
+
+    # Save experiment-level summary for later collection.
+    exp_metrics_df = pd.DataFrame([fold_metrics])
     exp_metrics_path = os.path.join(exp_dir, "experiment_fold_metrics.csv")
     exp_metrics_df.to_csv(exp_metrics_path, index=False)
     exp_summary = exp_metrics_df.mean(numeric_only=True).to_dict()
     exp_summary.update(exp)
     all_experiment_results.append(exp_summary)
 
-    # Save summary of all experiments.
+    # Save summary of all experiments processed so far.
     summary_df = pd.DataFrame(all_experiment_results)
     summary_csv_path = os.path.join(BASE_OUTPUT_DIR, "all_experiments_summary.csv")
     summary_df.to_csv(summary_csv_path, index=False)

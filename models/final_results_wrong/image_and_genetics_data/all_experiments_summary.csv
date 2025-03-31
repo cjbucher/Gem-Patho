@@ -1,0 +1,2 @@
+fold,best_epoch,best_val_loss,train_loss,train_cindex,val_loss,val_cindex_global,test_loss,test_cindex,test_risk_mean,test_risk_std,test_risk_OS_corr,transition_percentage,final_percentage,warmup,transition
+1.0,44.0,0.4772570729255676,0.34761549135049186,0.9044221581212875,0.4772570729255676,0.7101381607362655,0.35754992067813873,0.7210893559228623,-0.5766043066978455,3.1066057682037354,-0.18989348411560059,0.0,0.0,10,10
