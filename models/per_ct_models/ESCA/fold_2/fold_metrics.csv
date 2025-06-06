@@ -1,0 +1,2 @@
+fold,cancer_type,best_epoch,best_val_loss,train_loss,train_cindex,val_loss,val_cindex_global,normalized_val_cindex,test_loss,test_cindex,test_risk_mean,test_risk_std,test_risk_OS_corr
+2,ESCA,100,0.32804277539253235,0.3187147577603658,0.5283251231527094,0.32804277539253235,0.328125,0.328125,0.28618767857551575,0.27906976744186046,10.492515,0.03352523,0.26569244

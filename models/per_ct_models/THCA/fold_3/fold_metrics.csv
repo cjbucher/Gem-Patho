@@ -1,0 +1,2 @@
+fold,cancer_type,best_epoch,best_val_loss,train_loss,train_cindex,val_loss,val_cindex_global,normalized_val_cindex,test_loss,test_cindex,test_risk_mean,test_risk_std,test_risk_OS_corr
+3,THCA,100,0.1251731961965561,0.12330684810876846,0.6961970613656007,0.1251731961965561,0.4329896907216495,0.4329896907216495,0.1258031129837036,0.42857142857142855,-2.3913145,0.3194709,0.046477117

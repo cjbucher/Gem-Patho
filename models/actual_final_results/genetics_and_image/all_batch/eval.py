@@ -428,8 +428,10 @@ def main():
         fold_save_dir = os.path.join(BASE_OUTPUT_DIR, EXPERIMENT, f"fold_{fold}")
         test_risk_file = os.path.join(fold_save_dir, "test_risk_scores.csv")
         if os.path.exists(test_risk_file):
-            print(f"Test risk scores already computed for fold {fold} at {test_risk_file}. Skipping.")
-            continue
+            print(f"Test risk scores already computed for fold {fold} at {test_risk_file}. Not Skipping.")
+    
+
+
         
         fold_folder = os.path.join(INPUT_DIR, f"fold_{fold}")
         test_path = os.path.join(fold_folder, "test.parquet")
@@ -504,6 +506,13 @@ def main():
         global_cindex = concordance_index(all_test_df["OS.time"], -all_test_df["normalized_risk"], all_test_df["OS"])
         print(f"\nGlobal test c-index (all folds): {global_cindex:.4f}")
         
+
+        # Save the global test c-index in an extra file.
+        global_cindex_file = os.path.join(BASE_OUTPUT_DIR, EXPERIMENT, "global_test_cindex.txt")
+        with open(global_cindex_file, "w") as f:
+            f.write(str(global_cindex))
+        print(f"Saved global test c-index to {global_cindex_file}")
+
         # Compute per-cancer-type c-indices.
         cancer_types = all_test_df["cancer_type"].unique()
         ct_cindices = {}

@@ -1,0 +1,2 @@
+fold,cancer_type,best_epoch,best_val_loss,train_loss,train_cindex,val_loss,val_cindex_global,normalized_val_cindex,test_loss,test_cindex,test_risk_mean,test_risk_std,test_risk_OS_corr
+7,PRAD,100,0.1237531453371048,0.12317753086487453,0.7647668393782383,0.1237531453371048,,,0.1279103308916092,0.7868852459016393,5.411943,2.4759235,-0.24195193

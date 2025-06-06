@@ -2,17 +2,19 @@
 """
 Script to compute test risk scores from scratch using the best genetic-only model for each fold,
 normalize the risk scores within each fold, and then compute global and per–cancer-type c-indices.
-If a fold produces an error (e.g. no admissible pairs) or if the test risk file already exists,
-that fold is skipped.
+If a fold’s test risk file already exists, it is loaded (and the best model is checked) and used
+for global aggregation.
+ 
+Input directory: /n/data2/hms/dbmi/kyu/lab/chb3333/gem-patho/data_extraction/kfolds/jinaai_kfold_20val
+Base output directory: /n/data2/hms/dbmi/kyu/lab/chb3333/gem-patho/models/actual_final_results/only_genetics/all_batch
+There are folders fold_1, fold_2, …, fold_10.
 """
 
 import os
-import copy
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-import torch.optim as optim
 import random
 import argparse
 import matplotlib.pyplot as plt
@@ -195,9 +197,8 @@ class PreprocessedTransformerSurvivalModel(nn.Module):
 ##########################################
 def evaluate_model(model, dataloader, device):
     model.eval()
-    all_T, all_E, all_risk, all_ct, all_case_ids = [], [], [], [], []
-    losses = []
-    missing_cancer_types = []
+    all_T, all_E, all_risk = [], [], []
+    all_case_ids, all_types = [], []
     with torch.no_grad():
         for emb_batch, score_batch, cna_batch, cancer_type_batch, desc_batch, T_batch, E_batch, case_ids in dataloader:
             emb_batch = emb_batch.to(device)
@@ -225,51 +226,15 @@ def evaluate_model(model, dataloader, device):
             ct_idx = torch.tensor(ct_idx_list, device=device)
             
             loss = compute_loss(risk, T_batch, E_batch, ct_idx, model)
-            losses.append(loss.item())
             all_T.append(T_batch.cpu().numpy())
             all_E.append(E_batch.cpu().numpy())
             all_risk.append(risk.cpu().numpy())
-            all_ct.append(ct_idx.cpu().numpy())
             all_case_ids.extend(case_ids)
-    avg_loss = np.mean(losses)
-    all_T = np.concatenate(all_T).squeeze()
-    all_E = np.concatenate(all_E).squeeze() 
-    all_risk = np.concatenate(all_risk).squeeze()
-    all_ct = np.concatenate(all_ct).squeeze()
-    global_cindex = concordance_index(all_T, -all_risk, all_E)
-    
-    cindex_by_type = {}
-    normalized_values = []
-    unique_cts = np.unique(all_ct)
-    for ct in unique_cts:
-        mask_ct = (all_ct == ct)
-        n = np.sum(mask_ct)
-        if n < 2:
-            c_idx = np.nan
-            missing_cancer_types.append(int(ct))
-        else:
-            admissible_pairs = 0
-            T_subset = all_T[mask_ct]
-            E_subset = all_E[mask_ct]
-            for i in range(n):
-                for j in range(i+1, n):
-                    if T_subset[i] != T_subset[j] and (E_subset[i] == 1 or E_subset[j] == 1):
-                        admissible_pairs += 1
-            if admissible_pairs == 0:
-                c_idx = np.nan
-                missing_cancer_types.append(int(ct))
-            else:
-                try:
-                    c_idx = concordance_index(all_T[mask_ct], -all_risk[mask_ct], all_E[mask_ct])
-                except ZeroDivisionError:
-                    c_idx = np.nan
-                    missing_cancer_types.append(int(ct))
-        cindex_by_type[int(ct)] = c_idx
-        if not np.isnan(c_idx):
-            normalized_values.append(c_idx)
-    normalized_avg_cindex = np.mean(normalized_values) if normalized_values else np.nan
-    
-    return avg_loss, global_cindex, cindex_by_type, normalized_avg_cindex, all_T, all_risk, all_ct, all_case_ids, all_E, missing_cancer_types
+            all_types.extend([ct for ct in cancer_type_batch.cpu().numpy()])
+    global_cindex = concordance_index(np.concatenate(all_T).squeeze(),
+                                        -np.concatenate(all_risk).squeeze(),
+                                        np.concatenate(all_E).squeeze())
+    return global_cindex, np.concatenate(all_T).squeeze(), np.concatenate(all_risk).squeeze(), np.concatenate(all_E).squeeze(), all_case_ids, all_types
 
 ##########################################
 # Unified Loss Function
@@ -302,17 +267,28 @@ def main():
     EXPERIMENT = args.exp_folder
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    # We will collect test risk scores from each fold.
+    # Load the fixed gene list (used during training)
+    gene_list_path = "/n/data2/hms/dbmi/kyu/lab/chb3333/gem-patho/data_extraction/cancer_gene_list_selection/combined_genelist.csv"
+    gene_df = pd.read_csv(gene_list_path)
+    global gene_list
+    if "gene" in gene_df.columns:
+        gene_list = gene_df["gene"].tolist()
+    else:
+        gene_list = gene_df.iloc[:, 0].tolist()
+    print("Loaded gene list of length:", len(gene_list))
+    
     all_test_dfs = []
     batch_size = 64
 
+    # Process each fold: if a test risk file exists, load it; otherwise, compute and save it.
     for fold in range(1, NUM_FOLDS+1):
         print(f"\nProcessing Fold {fold} ...")
-        # Check if test risk scores already exist for this fold.
         fold_save_dir = os.path.join(BASE_OUTPUT_DIR, EXPERIMENT, f"fold_{fold}")
         test_risk_file = os.path.join(fold_save_dir, "test_risk_scores.csv")
         if os.path.exists(test_risk_file):
-            print(f"Test risk scores already computed for fold {fold} at {test_risk_file}. Skipping.")
+            print(f"Test risk scores already computed for fold {fold} at {test_risk_file}. Loading.")
+            df_test_risk = pd.read_csv(test_risk_file)
+            all_test_dfs.append(df_test_risk)
             continue
         
         fold_folder = os.path.join(INPUT_DIR, f"fold_{fold}")
@@ -331,7 +307,7 @@ def main():
         # Load best model for this fold.
         model_path = os.path.join(BASE_OUTPUT_DIR, EXPERIMENT, f"fold_{fold}", f"best_model_fold_{fold}.pth")
         if not os.path.exists(model_path):
-            print(f"Best model not found: {model_path}. Skipping fold {fold}.")
+            print(f"Best model not found for fold {fold} at {model_path}. Skipping.")
             continue
 
         # Determine embedding dimension (d_gene) from a sample batch.
@@ -354,7 +330,7 @@ def main():
             print(f"Error during evaluation for fold {fold}: {e}. Skipping fold {fold}.")
             continue
         
-        # Normalize risk scores within this fold (using z-score normalization).
+        # Normalize risk scores (z-score normalization within the fold)
         all_risk = np.array(all_risk)
         mean_risk = np.mean(all_risk)
         std_risk = np.std(all_risk)
@@ -363,17 +339,15 @@ def main():
         else:
             normalized_risk = all_risk
         
-        # Save the test risk scores for this fold.
         df_test_risk = pd.DataFrame({
             "Case ID": all_case_ids,
             "OS.time": all_T,
-            "OS": all_E,  # Include the event indicator
+            "OS": all_E,
             "risk": all_risk,
             "normalized_risk": normalized_risk,
             "cancer_type": all_ct,
             "fold": fold
         })
-
         os.makedirs(fold_save_dir, exist_ok=True)
         save_path = os.path.join(fold_save_dir, "test_risk_scores.csv")
         df_test_risk.to_csv(save_path, index=False)
@@ -381,16 +355,21 @@ def main():
         
         all_test_dfs.append(df_test_risk)
     
-    # Concatenate all fold data and compute global c-index.
+    # After processing all folds, concatenate results and compute global and per-cancer-type c-indices.
     if all_test_dfs:
         all_test_df = pd.concat(all_test_dfs, ignore_index=True)
         global_cindex = concordance_index(all_test_df["OS.time"], -all_test_df["normalized_risk"], all_test_df["OS"])
         print(f"\nGlobal test c-index (all folds): {global_cindex:.4f}")
         
+        # Save the global test c-index in an extra file.
+        global_cindex_file = os.path.join(BASE_OUTPUT_DIR, EXPERIMENT, "global_test_cindex.txt")
+        with open(global_cindex_file, "w") as f:
+            f.write(str(global_cindex))
+        print(f"Saved global test c-index to {global_cindex_file}")
+        
         # Compute per-cancer-type c-indices.
-        cancer_types = all_test_df["cancer_type"].unique()
         ct_cindices = {}
-        for ct in cancer_types:
+        for ct in all_test_df["cancer_type"].unique():
             subset = all_test_df[all_test_df["cancer_type"] == ct]
             if subset.shape[0] < 2:
                 ct_cindices[ct] = np.nan
@@ -403,7 +382,6 @@ def main():
                 ct_cindices[ct] = ct_cindex
                 print(f"Cancer type {ct}: c-index = {ct_cindex:.4f}")
         
-        # Save the global test risk scores and c-index summary.
         global_save_path = os.path.join(BASE_OUTPUT_DIR, EXPERIMENT, "global_test_risk_scores.csv")
         all_test_df.to_csv(global_save_path, index=False)
         print(f"Saved global test risk scores to {global_save_path}")

@@ -1,0 +1,2 @@
+fold,cancer_type,best_epoch,best_val_loss,train_loss,train_cindex,val_loss,val_cindex_global,normalized_val_cindex,test_loss,test_cindex,test_risk_mean,test_risk_std,test_risk_OS_corr
+7,BLCA,100,0.1680677905678749,0.1728528469800949,0.5867109917742829,0.1680677905678749,0.6617954070981211,0.6617954070981211,0.18152517080307007,0.5154185022026432,5.380503,0.7412981,-0.28998536

@@ -1,0 +1,2 @@
+fold,cancer_type,best_epoch,best_val_loss,train_loss,train_cindex,val_loss,val_cindex_global,normalized_val_cindex,test_loss,test_cindex,test_risk_mean,test_risk_std,test_risk_OS_corr
+10,UCS,100,0.2869597375392914,0.3587481677532196,0.6021314387211367,0.2869597375392914,0.5625,0.5625,0.38859471678733826,0.6923076923076923,-1.7446772,0.39359537,-0.6732218

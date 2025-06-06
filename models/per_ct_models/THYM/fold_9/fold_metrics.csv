@@ -1,0 +1,2 @@
+fold,cancer_type,best_epoch,best_val_loss,train_loss,train_cindex,val_loss,val_cindex_global,normalized_val_cindex,test_loss,test_cindex,test_risk_mean,test_risk_std,test_risk_OS_corr
+9,THYM,99,0.2629651725292206,0.2516978234052658,0.8782894736842105,0.2629651725292206,0.8260869565217391,0.8260869565217391,0.25227123498916626,1.0,-5.330065,2.1667585,-0.054118454

@@ -1,0 +1,2 @@
+fold,cancer_type,best_epoch,best_val_loss,train_loss,train_cindex,val_loss,val_cindex_global,normalized_val_cindex,test_loss,test_cindex,test_risk_mean,test_risk_std,test_risk_OS_corr
+6,KIRP,100,0.23830613493919373,0.23511259257793427,0.7877784467188441,0.23830613493919373,0.494949494949495,0.494949494949495,0.23545634746551514,0.8260869565217391,-1.9382012,0.6166107,-0.031740244

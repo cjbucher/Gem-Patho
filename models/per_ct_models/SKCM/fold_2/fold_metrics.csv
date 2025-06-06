@@ -1,0 +1,2 @@
+fold,cancer_type,best_epoch,best_val_loss,train_loss,train_cindex,val_loss,val_cindex_global,normalized_val_cindex,test_loss,test_cindex,test_risk_mean,test_risk_std,test_risk_OS_corr
+2,SKCM,100,0.18778212368488312,0.22611071169376373,0.5234298130534601,0.18778212368488312,0.5185840707964602,0.5185840707964602,0.2247852236032486,0.5522388059701493,11.588081,0.007510116,-0.1253952
